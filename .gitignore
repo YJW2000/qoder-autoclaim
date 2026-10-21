@@ -1,0 +1,6 @@
+*.log
+*.png
+uia-*.txt
+*-dump.txt
+.vscode/
+.idea/
