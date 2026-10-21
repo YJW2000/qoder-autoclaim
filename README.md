@@ -1,6 +1,6 @@
-# Qoder AutoClaim
+# Qoder自动签到脚本（Qoder AutoClaim）
 
-> 一个基于 Windows UI Automation 的 Qoder 桌面端每日积分自动领取脚本。  
+> Qoder自动签到脚本：基于 Windows UI Automation 的 Qoder 桌面端每日积分自动领取工具。  
 > 不调用 Qoder 内部 API、不保存账号凭据，通过模拟真实点击完成领取。
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)](https://www.microsoft.com/windows)
