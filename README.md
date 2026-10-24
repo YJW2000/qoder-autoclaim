@@ -2,6 +2,8 @@
 
 > Qoder自动签到脚本：基于 Windows UI Automation 的 Qoder 桌面端每日积分自动领取工具。  
 > 不调用 Qoder 内部 API、不保存账号凭据，通过模拟真实点击完成领取。
+>
+> 已在 Qoder **0.4.11**（2026-10-24）上实测通过，兼容旧版 0.4.x。
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)](https://www.microsoft.com/windows)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1-5391FE)](https://learn.microsoft.com/powershell/)
@@ -17,6 +19,8 @@
 ## 特性
 
 - 纯 PowerShell + 系统自带 UI Automation，无第三方依赖、无网络请求
+- 适配新版多进程：用 `EnumWindows` 按可见窗口选 Qoder 主界面，不再依赖会落到 helper 进程的 `MainWindowHandle`
+- 菜单项只接受可见的 `MenuItem`（或小尺寸 Button），不会把聊天区里含「权益中心」字样的大段文字当成入口
 - 幂等：只有拿到「已领取」按钮或「领取成功，Credits 已到账」的阳性证据时才写日期标记，当天不会重复领取
 - 不误判：权益弹层里既没有「领取」按钮、也没有「已领取」证据时**不写标记**，留给后续重试
 - 计划任务每天 10:05 触发，11:05、12:05 各重试一次；登录后 10 分钟再补跑一次
@@ -25,17 +29,19 @@
 
 ## 工作原理
 
-Qoder 的每日积分入口位于桌面端左下角「打开用户菜单」→「权益中心，有权益待领取」→「权益活动内容」弹层里。**实测领取窗口为每天 10:00（UTC+8）开放**。弹层内的每日卡片只会显示「领取」或「已领取」，领取成功后出现「领取成功，Credits 已到账」。注意：「查看我的用量」面板里没有这个入口，脚本不会去那里找。脚本按以下流程执行：
+Qoder 的每日积分入口位于桌面端左下角「打开用户菜单」→「权益中心，有权益待领取」→「权益活动内容 / 专属活动权益」弹层里。**实测领取窗口为每天 10:00（UTC+8）开放**。弹层内的每日卡片只会显示「领取」或「已领取」，领取成功后出现「领取成功，Credits 已到账」。注意：「查看我的用量」面板里没有这个入口，脚本不会去那里找。脚本按以下流程执行：
 
-1. 检查 `%LOCALAPPDATA%\QoderAutoClaim\last-claim.txt` 是否已是当前窗口，是则退出
+1. 检查 `%LOCALAPPDATA%\QoderAutoClaim\last-claim.txt` 是否已是当前窗口，是则退出（`-DryRun` / `-DumpTree` 不受标记限制）
 2. 等待到配置的领取时间（默认 10:05；早于该时间触发且超过等待上限则退出 2）
-3. 定位 Qoder 进程；未运行则以 `--force-renderer-accessibility` 启动
-4. 还原/激活 Qoder 窗口，注册 UIA 焦点事件，让 Chromium 保持辅助功能树
-5. 用 `EnumWindows` 枚举该进程的全部顶层窗口，再用 `TreeWalker` 遍历控件树
-6. 用真实鼠标点击左下角「打开用户菜单」，再点击菜单里的「权益中心，有权益待领取」
-7. 等待独立 HWND 的「权益活动内容」弹层加载完成
+3. 枚举所有 Qoder 进程的可见顶层窗口，选择标题为 `Qoder`、面积最大的窗口作为主界面；未运行则以 `--force-renderer-accessibility` 启动
+4. 还原/激活主窗口，注册 UIA 焦点事件，让 Chromium 保持辅助功能树
+5. 用 `EnumWindows` 枚举全部可见顶层窗口，再用 `TreeWalker` 遍历控件树；新版 0.4.11 的权益弹层位于主窗口内，旧版可能是独立 HWND，两种都能扫描到
+6. 用真实鼠标点击左下角整块「打开用户菜单」区域，再点击菜单里可见的 `MenuItem`「权益中心，有权益待领取」
+7. 等待「权益活动内容 / 专属活动权益」弹层加载完成
 8. 在弹层内点击精确匹配的「领取」按钮（只认 `^领取$`，避免误点「每天领 100 Credits」）
 9. 只认完全落在弹层矩形内的「已领取」按钮或「领取成功，Credits 已到账」文案；拿到阳性证据才写标记。没有入口不写标记；结果未知则 exit 3
+
+> 0.4.11 起 Qoder 会有多个同名进程，前台窗口 PID 不一定等于主进程 PID。脚本的前台校验按**进程名 Qoder** 判定，点击前再用 `WindowFromPoint` 校验坐标处窗口确实属于 Qoder，避免旧版「明明 Qoder 在前台却提示未能调到前台」的问题。
 
 ### 为什么不用 Qoder API
 
@@ -98,11 +104,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Qoder-AutoClaim.ps1 -ExePa
 $ClaimHour     = 10   # 本机时区的领取小时
 $ClaimMinute   = 5    # 领取分钟；计划任务也按 10:05 注册
 $RefreshHour   = 10   # Qoder 每天 10:00 (UTC+8) 刷新
-$MenuButtonRegex  = '^打开用户菜单$'
-$RightsEntryRegex = '权益中心'
-$RightsDialogName = '权益活动内容'
-$ClaimRegex       = '^领取$'
-$ClaimedRegex     = '已领取|领取成功|Credits 已到账|Claimed|明日再来|明天再来|今日已领'
+$MenuButtonRegex   = '^打开用户菜单$'
+$RightsEntryRegex  = '权益中心'
+$RightsDialogRegex = '权益活动内容|专属活动权益'
+$ClaimRegex        = '^领取$'
+$ClaimedRegex      = '已领取|领取成功|Credits 已到账|Claimed|明日再来|明天再来|今日已领'
 ```
 
 > Qoder 每日领取窗口实测为 **10:00（UTC+8）** 开放。默认计划任务在 **10:05** 首次运行，11:05、12:05 再各重试一次；如果首次运行时活动页尚未刷新，后两轮会补上。若以后开放时间变化，请同时调整 `$ClaimHour`/`$ClaimMinute`、`$RefreshHour`/`$RefreshMinute` 和 `Install-AutoClaimTask.ps1` 中的计划任务时间。
@@ -155,7 +161,11 @@ Unregister-ScheduledTask -TaskName Qoder-AutoClaim -Confirm:$false
 ## 常见问题
 
 **脚本退出 3，日志提示找不到「打开用户菜单」**  
-Qoder 可能改版。先用 `-DumpTree` 导出 `uia-latest.txt`，根据实际控件名调整 `$MenuButtonRegex` / `$RightsEntryRegex` / `$RightsDialogName` / `$ClaimRegex`。
+Qoder 可能改版。先用 `-DumpTree` 导出 `uia-latest.txt`，根据实际控件名调整 `$MenuButtonRegex` / `$RightsEntryRegex` / `$RightsDialogRegex` / `$ClaimRegex`。
+
+**Qoder 更新后日志提示「Qoder 未能调到前台」**
+
+0.4.11 起 Qoder 会有多个同名进程，旧脚本用 `MainWindowHandle` 可能选中 helper 进程。当前脚本已改为按可见窗口选主界面、按进程名 `Qoder` 校验前台；若仍提示，请确认主窗口未最小化或被其他窗口完全遮挡，再用 `-DumpTree` 检查主窗口标题是否仍为 `Qoder`。
 
 **日志提示「没有找到可用的权益入口」**  
 说明用户菜单里没有「权益中心」或菜单项没有加载出来。大概率还没到开放时间（实测为 10:00 UTC+8），脚本不会写标记，计划任务会在下一个整点重试。如果整天都如此，请手动打开一次权益中心确认状态，并用 `-DumpTree` 检查菜单项名称是否变化。
@@ -167,7 +177,7 @@ Qoder 可能改版。先用 `-DumpTree` 导出 `uia-latest.txt`，根据实际�
 确保 Qoder 未最小化，并且是以交互式用户身份运行。脚本会尝试激活窗口；如果仍然失败，可手动启动 Qoder 后再运行。
 
 **脚本没有点中按钮 / 点到了别的窗口**  
-脚本在点击前会校验 Qoder 是否在前台，并额外用 `WindowFromPoint` + 窗口 PID 校验点击坐标处确实属于 Qoder；任一检查失败就跳过本轮。请避免在运行时段用其他窗口完全遮挡 Qoder。
+脚本在点击前会校验前台窗口属于 Qoder，并额外用 `WindowFromPoint` + 窗口 PID 校验点击坐标处确实属于 Qoder；菜单项只接受可见的 `MenuItem`，不会匹配聊天里的大段文字。任一检查失败就跳过本轮。请避免在运行时段用其他窗口完全遮挡 Qoder。
 
 **计划任务没有运行**  
 检查任务状态与上次结果：
@@ -185,6 +195,14 @@ Get-ScheduledTaskInfo -TaskName Qoder-AutoClaim | Format-List LastRunTime,LastTa
 - 所有数据仅保存在本机 `%LOCALAPPDATA%\QoderAutoClaim\`
 
 ## 变更记录
+
+### 2026-10-24
+
+- **适配 Qoder 0.4.11 多进程**：新版 Qoder 有多个同名进程，`Get-Process ... MainWindowHandle` 可能落到 helper 上，造成「Qoder 明明在前台却未能调到前台」。脚本改为用 `EnumWindows` 枚举可见顶层窗口，选择标题为 `Qoder`、面积最大的主窗口。
+- **前台/点击校验**：前台判断改为按进程名 `Qoder`（接受全部 Qoder 进程）；鼠标点击前仍用 `WindowFromPoint` 校验坐标处顶层窗口属于 Qoder。
+- **避免误点聊天内容**：菜单项只接受可见的 `MenuItem`（或小尺寸 Button），不再用任意包含「权益中心」的文本匹配；旧版曾因聊天内容含该词而点错位置。
+- **兼容新版弹层**：弹层窗口名兼容「权益活动内容」和「专属活动权益」；新版弹层位于主窗口内，旧版可能是独立 HWND，扫描逻辑均可覆盖。
+- **实测**：2026-10-24 17:53 在 Qoder 0.4.11 上完成一次真实领取，日志确认点击「领取」后检测到「已领取」，写入 `last-claim.txt = 2026-10-24`，随后再次运行命中标记直接退出。
 
 ### 2026-10-21
 

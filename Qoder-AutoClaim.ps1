@@ -1,8 +1,9 @@
 ﻿<#
 Qoder自动签到脚本 (Qoder AutoClaim) - Qoder 每日积分自动领取
+适配 Qoder 0.4.11+ (旧版 0.4.x 同样可用)
 规则: 每日 10:00 (UTC+8) 刷新后, 桌面端左下角「打开用户菜单」->「权益中心，有权益待领取」
-     -> 权益活动弹层 -> 点击「领取」。每个窗口限领一次, 错过不补。
-     领取成功的证据: 弹层内按钮变为「已领取」且出现「领取成功，Credits 已到账」。
+     -> 「权益活动内容 / 专属活动权益」弹层 -> 点击「领取」。
+     领取成功的证据: 弹层内按钮变为「已领取」，或出现「领取成功，Credits 已到账」。
      注意: 「我的用量」面板里没有领取入口, 不要在用量面板里找。
 
 用法:
@@ -15,11 +16,15 @@ Qoder自动签到脚本 (Qoder AutoClaim) - Qoder 每日积分自动领取
   powershell -NoProfile -ExecutionPolicy Bypass -File Qoder-AutoClaim.ps1 -ExePath "C:\...\Qoder.exe"
       正式领取(可选 -ExePath 指定 Qoder.exe)
 退出码: 0=成功/已领取/暂无领取入口(待下轮重试)  2=未到领取时间且超等待上限
-        3=入口或弹层流程未走通  4=环境异常
-诊断文件(每次覆盖): %LOCALAPPDATA%\QoderAutoClaim\{autoclaim.log, uia-latest.txt, screen-latest.png}
+        3=入口或弹层流程未走通/结果未知(未写标记)  4=环境异常
 
-注意: 本文件必须保持 UTF-8 with BOM, 否则 Windows PowerShell 5.1 会把中文读成乱码,
-      导致控件名匹配和日志全部失效。
+关键改动 (2026-10-24, 适配 Qoder 0.4.11):
+  - 不再用 Get-Process.MainWindowHandle 猜主进程: 新版 Qoder 有多个同名进程,
+    MainWindowHandle 可能落在 helper 上, 导致明明 Qoder 在前台却判定"未能调到前台"。
+    现在用 EnumWindows 枚举可见顶层窗口, 选标题为 Qoder、面积最大的主窗口。
+  - 前台/点击安全校验改为按进程名 Qoder 判断(接受全部 Qoder 进程), 不再要求 PID 完全相等。
+  - 菜单项只接受可见的 MenuItem(或小尺寸 Button), 不再用大段聊天文本匹配「权益中心」。
+  - 兼容旧弹层名「权益活动内容」和新标题「专属活动权益」。
 #>
 param(
     [switch]$DryRun,
@@ -29,393 +34,544 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+namespace Native {
+public static class Win32 {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder s, int n);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+}
+}
+'@
+[void][Native.Win32]::SetProcessDPIAware()
 
-# ==================== 可调配置 ====================
-$ClaimHour     = 10          # 每日领取时间(本机时区): 每天 10:05 由计划任务触发
-$ClaimMinute   = 5
-$RefreshHour   = 10          # Qoder 每日 10:00 (UTC+8) 刷新领取窗口
-$RefreshMinute = 0
-$QoderProcName = 'Qoder'
-$ExeCandidates = @("$env:LOCALAPPDATA\Programs\Qoder\Qoder.exe")
+# ==================== 配置 ====================
+$QoderProcessName  = 'Qoder'
+$ClaimHour         = 10
+$ClaimMinute       = 5
+$RefreshHour       = 10
+$RefreshMinute     = 0
+$MenuButtonRegex   = '^打开用户菜单$'
+$RightsEntryRegex  = '权益中心'
+$RightsDialogRegex = '权益活动内容|专属活动权益'
+$ClaimRegex        = '^领取$'
+$ClaimedRegex      = '已领取|领取成功|Credits 已到账|Claimed|明日再来|明天再来|今日已领'
 
-# 控件名称匹配规则 (依据 -DumpTree / probe 结果调整)
-$MenuButtonRegex  = '^打开用户菜单$'                  # 左下角用户菜单按钮
-$RightsEntryRegex = '权益中心'                          # 用户菜单里的「权益中心，有权益待领取」
-$RightsDialogName = '权益活动内容'                      # 权益活动弹层窗口名
-$ClaimRegex       = '^领取$'                            # 弹层内的领取按钮(精确匹配, 避免误点「每天领 100 Credits」)
-$ClaimedRegex     = '已领取|领取成功|Credits 已到账|Claimed|明日再来|明天再来|今日已领'
-$NoClickRegex     = '关闭|最小化|最大化|刷新用量|查看详情'   # 这些按钮永远不当领取入口
+$Root       = Join-Path $env:LOCALAPPDATA 'QoderAutoClaim'
+$LogFile    = Join-Path $Root 'autoclaim.log'
+$MarkerFile = Join-Path $Root 'last-claim.txt'
+$DumpFile   = Join-Path $Root 'uia-latest.txt'
+$ShotFile   = Join-Path $Root 'screen-latest.png'
+$ExeCandidates = @(
+    (Join-Path $env:LOCALAPPDATA 'Programs\Qoder\Qoder.exe'),
+    (Join-Path $env:ProgramFiles 'Qoder\Qoder.exe')
+)
+if (-not (Test-Path $Root)) { New-Item -ItemType Directory -Path $Root -Force | Out-Null }
+$script:LogEncoding = New-Object System.Text.UTF8Encoding($false)
+$script:PidCache = @{}
 
-$LogDir      = Join-Path $env:LOCALAPPDATA 'QoderAutoClaim'
-$LogFile     = Join-Path $LogDir 'autoclaim.log'
-$MarkerFile  = Join-Path $LogDir 'last-claim.txt'
-$DumpFile    = Join-Path $LogDir 'uia-latest.txt'
-$ShotFile    = Join-Path $LogDir 'screen-latest.png'
-# ==================================================
-
-New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-
+# ==================== 日志与诊断 ====================
 function Write-Log {
-    param([string]$Level, [string]$Msg)
-    $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Msg
-    $line | Out-File -FilePath $LogFile -Append -Encoding utf8
+    param([string]$Level, [string]$Message)
+    $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    try { [System.IO.File]::AppendAllText($LogFile, $line + "`r`n", $script:LogEncoding) } catch { }
     Write-Host $line
 }
 
-Add-Type -Namespace Native -Name User32 -MemberDefinition @'
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-[DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
-[DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
-[DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
-[DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lp);
-[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
-[DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT pt);
-[DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
-[DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
-[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
-public delegate bool EnumProc(IntPtr hWnd, IntPtr lp);
-'@
-
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-
 function Save-Screenshot {
     try {
-        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
         $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
-        $bmp = New-Object System.Drawing.Bitmap $vs.Width, $vs.Height
+        $bmp = New-Object System.Drawing.Bitmap($vs.Width, $vs.Height)
         $g = [System.Drawing.Graphics]::FromImage($bmp)
-        $g.CopyFromScreen($vs.X, $vs.Y, 0, 0, $bmp.Size)
+        $g.CopyFromScreen($vs.Left, $vs.Top, 0, 0, $bmp.Size)
+        $g.Dispose()
         $bmp.Save($ShotFile, [System.Drawing.Imaging.ImageFormat]::Png)
-        $g.Dispose(); $bmp.Dispose()
+        $bmp.Dispose()
         Write-Log INFO "已保存截图: $ShotFile"
-    } catch { Write-Log WARN "截图失败: $($_.Exception.Message)" }
-}
-
-$script:walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
-
-# TreeWalker 逐节点遍历(对 Chromium 忙状态鲁棒), 覆盖进程的全部顶层窗口
-function Get-AllElements {
-    param([int]$ProcId, [int]$MaxNodes = 15000)
-    # 用 EnumWindows 而非 UIA RootElement.FindAll: 后者漏掉 Chromium 的弹层 HWND(如权益活动弹层),
-    # 弹层内容都在独立顶层窗口里, 漏枚举会导致永远找不到领取按钮
-    $script:_wins = @()
-    $cb = [Native.User32+EnumProc] { param($h, $lp)
-        $p = 0
-        $null = [Native.User32]::GetWindowThreadProcessId($h, [ref]$p)
-        if ($p -eq $ProcId) { $script:_wins += $h }
-        return $true
-    }
-    $null = [Native.User32]::EnumWindows($cb, [IntPtr]::Zero)
-    $out = New-Object System.Collections.ArrayList
-    Write-Log DEBUG "Get-AllElements: 顶层窗口数 $($script:_wins.Count)"
-    foreach ($h in $script:_wins) {
-        try {
-            $w = [System.Windows.Automation.AutomationElement]::FromHandle($h)
-        } catch { continue }
-        $stack = New-Object System.Collections.Stack
-        $stack.Push($w)
-        while ($stack.Count -gt 0 -and $out.Count -lt $MaxNodes) {
-            $n = $stack.Pop()
-            [void]$out.Add($n)
-            try {
-                $ch = $script:walker.GetFirstChild($n)
-                while ($ch -and $out.Count -lt $MaxNodes) {
-                    $stack.Push($ch)
-                    $ch = $script:walker.GetNextSibling($ch)
-                }
-            } catch { }
-        }
-    }
-    return $out
-}
-
-function Get-CName { param($e) try { return [string]$e.Current.Name } catch { return '' } }
-
-function Test-InRect {
-    param($Rect, $Outer)
-    if ($null -eq $Rect -or $null -eq $Outer) { return $false }
-    if ($Rect.IsEmpty -or $Outer.IsEmpty) { return $false }
-    # 必须完全包含在弹层内: 聊天区大段文字的中心也可能落在弹层矩形里, 用中心点判断会误匹配
-    $tol = 2
-    return ($Rect.X -ge ($Outer.X - $tol) -and $Rect.Y -ge ($Outer.Y - $tol) -and
-            ($Rect.X + $Rect.Width) -le ($Outer.X + $Outer.Width + $tol) -and
-            ($Rect.Y + $Rect.Height) -le ($Outer.Y + $Outer.Height + $tol))
-}
-
-function Find-Interactive {
-    param($Elements, [string]$Regex, [switch]$SkipNoClickFilter)
-    $allowed = @('ControlType.Button', 'ControlType.Hyperlink', 'ControlType.ListItem',
-                 'ControlType.TreeItem', 'ControlType.MenuItem', 'ControlType.TabItem')
-    foreach ($e in $Elements) {
-        try {
-            $c = $e.Current
-            $n = [string]$c.Name
-            if (-not $n) { continue }
-            if ($allowed -notcontains $c.ControlType.ProgrammaticName) { continue }
-            if ($n -match $ClaimedRegex) { continue }
-            if (-not $SkipNoClickFilter -and $n -match $NoClickRegex) { continue }
-            if ($n -match $Regex) { return $e }
-        } catch { }
-    }
-    return $null
-}
-
-function Get-RightsDialog {
-    param($Elements)
-    foreach ($e in $Elements) {
-        try {
-            $c = $e.Current
-            if ($c.ControlType.ProgrammaticName -eq 'ControlType.Window' -and [string]$c.Name -eq $RightsDialogName) { return $e }
-        } catch { }
-    }
-    return $null
-}
-
-function Get-ClaimButton {
-    param($Elements, $Rect)
-    foreach ($e in $Elements) {
-        try {
-            $c = $e.Current
-            if ($c.ControlType.ProgrammaticName -ne 'ControlType.Button') { continue }
-            if ([string]$c.Name -ne '领取') { continue }
-            if (-not (Test-InRect $c.BoundingRectangle $Rect)) { continue }
-            return $e
-        } catch { }
-    }
-    return $null
-}
-
-function Get-ClaimedEvidence {
-    param($Elements, $Rect)
-    foreach ($e in $Elements) {
-        try {
-            $c = $e.Current
-            $n = [string]$c.Name
-            if (-not $n -or $n -notmatch $ClaimedRegex) { continue }
-            if ($c.ControlType.ProgrammaticName -notmatch 'Text|Button|StatusBar') { continue }
-            if (-not (Test-InRect $c.BoundingRectangle $Rect)) { continue }
-            return $n
-        } catch { }
-    }
-    return $null
-}
-
-function Invoke-Click {
-    param($e, [switch]$ForceMouse)
-    if (-not $ForceMouse) {
-        foreach ($p in @([System.Windows.Automation.InvokePattern]::Pattern,
-                         [System.Windows.Automation.TogglePattern]::Pattern,
-                         [System.Windows.Automation.SelectionItemPattern]::Pattern)) {
-            $o = $null
-            if ($e.TryGetCurrentPattern($p, [ref]$o)) {
-                if ($o -is [System.Windows.Automation.InvokePattern]) { $o.Invoke() }
-                elseif ($o -is [System.Windows.Automation.TogglePattern]) { $o.Toggle() }
-                else { $o.Select() }
-                return $true
-            }
-        }
-    }
-    # 鼠标兜底: 需要窗口在前台。Chromium 部分控件 Expand 只翻 aria 不触发 onClick,
-    # 菜单项/领取按钮一律走真实鼠标点击(ForceMouse)
-    try {
-        $r = $e.Current.BoundingRectangle
-        if ($r.IsEmpty) { Write-Log WARN '控件矩形为空, 无法点击'; return $false }
-        $pt = $null
-        try { $pt = $e.GetClickablePoint() } catch { }
-        if (-not $pt) { $pt = [System.Windows.Point]::new([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2)) }
-        # 点击前确认坐标处窗口属于 Qoder, 防止 Qoder 被其他窗口覆盖时误点(例如用户正在别的应用操作)
-        $hit = New-Object Native.User32+POINT
-        $hit.X = [int]$pt.X; $hit.Y = [int]$pt.Y
-        $winAt = [Native.User32]::WindowFromPoint($hit)
-        $rootAt = [Native.User32]::GetAncestor($winAt, 2)
-        $rootPid = 0
-        $null = [Native.User32]::GetWindowThreadProcessId($rootAt, [ref]$rootPid)
-        if ($script:QoderPid -and $rootPid -ne $script:QoderPid) {
-            Write-Log WARN ("点击坐标被其他窗口覆盖(该点窗口 PID=$rootPid, Qoder PID=$($script:QoderPid)), 跳过以防误点")
-            return $false
-        }
-        Write-Log INFO ("[click] 鼠标点击 ({0},{1}) rect=({2},{3},{4}x{5}) name=[{6}]" -f [int]$pt.X, [int]$pt.Y, [int]$r.X, [int]$r.Y, [int]$r.Width, [int]$r.Height, (Get-CName $e))
-        [Native.User32]::SetCursorPos([int]$pt.X, [int]$pt.Y) | Out-Null
-        Start-Sleep -Milliseconds 150
-        [Native.User32]::mouse_event(0x02, 0, 0, 0, [UIntPtr]::Zero)
-        Start-Sleep -Milliseconds 60
-        [Native.User32]::mouse_event(0x04, 0, 0, 0, [UIntPtr]::Zero)
-        Start-Sleep -Milliseconds 800
-        return $true
     } catch {
-        Write-Log WARN "鼠标点击失败: $($_.Exception.Message)"
-        return $false
+        Write-Log WARN "保存截图失败: $($_.Exception.Message)"
     }
-}
-
-# 恢复最小化/隐藏窗口并真实激活(Chromium 最小化时丢弃 a11y 树, 需要激活后才重建)
-function Activate-Qoder {
-    param([IntPtr]$Hwnd)
-    if ([Native.User32]::IsIconic($Hwnd)) { [Native.User32]::ShowWindow($Hwnd, 9) | Out-Null; Start-Sleep -Milliseconds 800 }
-    if (-not [Native.User32]::IsWindowVisible($Hwnd)) { [Native.User32]::ShowWindow($Hwnd, 5) | Out-Null; Start-Sleep -Milliseconds 800 }
-    [Native.User32]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)   # ALT 解除前台锁定
-    [Native.User32]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
-    # SetForegroundWindow 在用户正在别的窗口输入时会被系统拒绝, AttachThreadInput 可提高成功率
-    $fg = [Native.User32]::GetForegroundWindow()
-    $fgPid = 0
-    $fgThread = [Native.User32]::GetWindowThreadProcessId($fg, [ref]$fgPid)
-    $curThread = [Native.User32]::GetCurrentThreadId()
-    $attached = $false
-    if ($fgThread -ne 0 -and $fgThread -ne $curThread) {
-        $attached = [Native.User32]::AttachThreadInput($curThread, $fgThread, $true)
-    }
-    [Native.User32]::SetForegroundWindow($Hwnd) | Out-Null
-    [Native.User32]::BringWindowToTop($Hwnd) | Out-Null
-    if ($attached) { [Native.User32]::AttachThreadInput($curThread, $fgThread, $false) | Out-Null }
-    Start-Sleep -Milliseconds 400
-}
-
-function Test-QoderForeground {
-    param([int]$ProcId)
-    $fgPid = 0
-    $null = [Native.User32]::GetWindowThreadProcessId([Native.User32]::GetForegroundWindow(), [ref]$fgPid)
-    return ($fgPid -eq $ProcId)
 }
 
 function Write-Dump {
     param($Elements)
-    $sw = New-Object System.IO.StreamWriter($DumpFile, $false, [System.Text.Encoding]::UTF8)
-    $sw.WriteLine("共 $($Elements.Count) 个元素, 时间 $(Get-Date)")
-    $sw.WriteLine('---- 与规则匹配的候选 ----')
-    foreach ($rgx in @($ClaimRegex, $ClaimedRegex, $RightsEntryRegex, $MenuButtonRegex)) {
-        $sw.WriteLine("[规则: $rgx]")
-        foreach ($e in $Elements) {
-            $n = Get-CName $e
-            if ($n -and $n -match $rgx) {
-                $c = $e.Current
-                $t = $c.ControlType.ProgrammaticName -replace 'ControlType\.', ''
-                $sw.WriteLine("  Type=$t Name=[$n] Offscreen=$($c.IsOffscreen)")
+    try {
+        $sw = New-Object System.IO.StreamWriter($DumpFile, $false, [System.Text.Encoding]::UTF8)
+        $sw.WriteLine("共 $($Elements.Count) 个元素, 时间 $(Get-Date)")
+        if ($script:MainWindow) {
+            $mw = $script:MainWindow
+            $sw.WriteLine("主窗口: hwnd=$($mw.Hwnd) pid=$($mw.Pid) rect=$($mw.Left),$($mw.Top) $($mw.Width)x$($mw.Height)")
+        }
+        $sw.WriteLine('---- 与规则匹配的候选 ----')
+        foreach ($rgx in @($ClaimRegex, $ClaimedRegex, $RightsEntryRegex, $MenuButtonRegex, $RightsDialogRegex)) {
+            $sw.WriteLine("[规则: $rgx]")
+            foreach ($e in $Elements) {
+                if ($e.Name -and $e.Name -match $rgx) {
+                    $sw.WriteLine("  Type=$($e.Type) Name=[$($e.Name)] Offscreen=$($e.Offscreen) Enabled=$($e.Enabled) Rect=$($e.Rect)")
+                }
             }
         }
-    }
-    $sw.WriteLine('---- 全部可交互控件 ----')
-    $allowed = @('ControlType.Button', 'ControlType.Hyperlink', 'ControlType.ListItem',
-                 'ControlType.TreeItem', 'ControlType.MenuItem', 'ControlType.TabItem')
-    foreach ($e in $Elements) {
-        try {
-            $c = $e.Current
-            if ($allowed -contains $c.ControlType.ProgrammaticName) {
-                $t = $c.ControlType.ProgrammaticName -replace 'ControlType\.', ''
-                $sw.WriteLine("Type=$t Name=[$($c.Name)] Offscreen=$($c.IsOffscreen)")
+        $sw.WriteLine('---- 全部可交互控件 ----')
+        $allowed = @('Button', 'Hyperlink', 'ListItem', 'TreeItem', 'MenuItem', 'TabItem', 'Window', 'Text', 'StatusBar')
+        foreach ($e in $Elements) {
+            if ($allowed -contains $e.Type) {
+                $sw.WriteLine("Type=$($e.Type) Name=[$($e.Name)] Offscreen=$($e.Offscreen) Enabled=$($e.Enabled) Rect=$($e.Rect)")
             }
-        } catch { }
+        }
+        $sw.Dispose()
+        Write-Log INFO "控件树已导出: $DumpFile"
+    } catch {
+        Write-Log WARN "导出控件树失败: $($_.Exception.Message)"
     }
-    $sw.Dispose()
-    Write-Log INFO "控件树已导出: $DumpFile"
+}
+
+# ==================== 时间窗口与标记 ====================
+function Get-TodayRefreshAt {
+    $now = Get-Date
+    return (Get-Date -Year $now.Year -Month $now.Month -Day $now.Day -Hour $RefreshHour -Minute $RefreshMinute -Second 0)
+}
+
+function Get-ClaimWindowKey {
+    $now = Get-Date
+    $refresh = Get-TodayRefreshAt
+    if ($now -lt $refresh) { return $refresh.AddDays(-1).ToString('yyyy-MM-dd') }
+    return $refresh.ToString('yyyy-MM-dd')
 }
 
 function Set-ClaimedMarker {
+    param([string]$Key)
     if ($DryRun) { Write-Log INFO '[DryRun] 不写标记'; return }
-    Set-Content -Path $MarkerFile -Value $windowKey -Encoding utf8
-    Write-Log INFO "已写标记: $MarkerFile = $windowKey"
+    try {
+        Set-Content -Path $MarkerFile -Value $Key -Encoding utf8
+        Write-Log INFO "已写标记: $MarkerFile = $Key"
+    } catch {
+        Write-Log ERROR "写标记失败: $($_.Exception.Message)"
+        exit 3
+    }
+}
+
+# ==================== 进程与窗口 ====================
+function Test-QoderPid {
+    param([int]$ProcId)
+    if ($ProcId -le 0) { return $false }
+    if ($script:PidCache.ContainsKey($ProcId)) { return $script:PidCache[$ProcId] }
+    $ok = $false
+    try {
+        $p = Get-Process -Id $ProcId -ErrorAction Stop
+        $ok = ($p.ProcessName -eq $QoderProcessName)
+    } catch { $ok = $false }
+    $script:PidCache[$ProcId] = $ok
+    return $ok
+}
+
+function Get-QoderWindows {
+    $script:WindowRows = New-Object System.Collections.Generic.List[object]
+    $cb = [Native.Win32+EnumWindowsProc] {
+        param([IntPtr]$hWnd, [IntPtr]$lParam)
+        $wpid = 0
+        [void][Native.Win32]::GetWindowThreadProcessId($hWnd, [ref]$wpid)
+        if ((Test-QoderPid ([int]$wpid)) -and [Native.Win32]::IsWindowVisible($hWnd)) {
+            $title = New-Object System.Text.StringBuilder 512
+            [void][Native.Win32]::GetWindowText($hWnd, $title, 512)
+            $cls = New-Object System.Text.StringBuilder 256
+            [void][Native.Win32]::GetClassName($hWnd, $cls, 256)
+            $rect = New-Object Native.Win32+RECT
+            [void][Native.Win32]::GetWindowRect($hWnd, [ref]$rect)
+            $w = $rect.Right - $rect.Left
+            $h = $rect.Bottom - $rect.Top
+            $script:WindowRows.Add([pscustomobject]@{
+                Hwnd = $hWnd; Pid = [int]$wpid; Title = $title.ToString(); Class = $cls.ToString()
+                Left = $rect.Left; Top = $rect.Top; Width = $w; Height = $h; Area = ($w * $h)
+                Iconic = [Native.Win32]::IsIconic($hWnd)
+            })
+        }
+        return $true
+    }
+    [void][Native.Win32]::EnumWindows($cb, [IntPtr]::Zero)
+    return $script:WindowRows
+}
+
+function Get-QoderMainWindow {
+    $wins = @(Get-QoderWindows)
+    # 主窗口最小化时 GetWindowRect 可能偏小, 标题精确为 Qoder 的窗口优先, 不强制面积
+    $candidates = @($wins | Where-Object {
+        $_.Class -eq 'Chrome_WidgetWin_1' -and $_.Title -eq 'Qoder'
+    })
+    if ($candidates.Count -eq 0) {
+        $candidates = @($wins | Where-Object {
+            $_.Class -eq 'Chrome_WidgetWin_1' -and $_.Title -notmatch 'Companion|Desktop Pet' -and $_.Area -gt 200000
+        })
+    }
+    if ($candidates.Count -eq 0) { return $null }
+    return ($candidates | Sort-Object Area -Descending | Select-Object -First 1)
+}
+
+function Get-ForegroundInfo {
+    $hWnd = [Native.Win32]::GetForegroundWindow()
+    $wpid = 0
+    [void][Native.Win32]::GetWindowThreadProcessId($hWnd, [ref]$wpid)
+    $title = New-Object System.Text.StringBuilder 512
+    [void][Native.Win32]::GetWindowText($hWnd, $title, 512)
+    $root = [Native.Win32]::GetAncestor($hWnd, 2)
+    return [pscustomobject]@{ Hwnd = $hWnd; Root = $root; Pid = [int]$wpid; Title = $title.ToString() }
+}
+
+function Test-QoderForeground {
+    $fg = Get-ForegroundInfo
+    return (Test-QoderPid $fg.Pid)
+}
+
+function Activate-Qoder {
+    param($Main)
+    if ($null -eq $Main -or $Main.Hwnd -eq [IntPtr]::Zero) { return $false }
+    if ($Main.Iconic) { [void][Native.Win32]::ShowWindow($Main.Hwnd, 9) }
+    if (-not [Native.Win32]::IsWindowVisible($Main.Hwnd)) { [void][Native.Win32]::ShowWindow($Main.Hwnd, 5) }
+
+    $fg = Get-ForegroundInfo
+    if ($fg.Root -eq $Main.Hwnd) { return $true }
+
+    # ALT 解除前台锁定; AttachThreadInput 提高 SetForegroundWindow 成功率
+    [Native.Win32]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+    [Native.Win32]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+    $fgPid = 0
+    $fgThread = [Native.Win32]::GetWindowThreadProcessId([Native.Win32]::GetForegroundWindow(), [ref]$fgPid)
+    $curThread = [Native.Win32]::GetCurrentThreadId()
+    $attached = $false
+    if ($fgThread -ne 0 -and $fgThread -ne $curThread) {
+        $attached = [Native.Win32]::AttachThreadInput($curThread, $fgThread, $true)
+    }
+    [void][Native.Win32]::SetForegroundWindow($Main.Hwnd)
+    [void][Native.Win32]::BringWindowToTop($Main.Hwnd)
+    if ($attached) { [void][Native.Win32]::AttachThreadInput($curThread, $fgThread, $false) }
+    Start-Sleep -Milliseconds 500
+    return (Test-QoderForeground)
+}
+
+function Find-QoderExe {
+    if ($ExePath -and (Test-Path $ExePath)) { return $ExePath }
+    $p = Get-Process -Name $QoderProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($p -and $p.Path) { return $p.Path }
+    foreach ($c in $ExeCandidates) { if (Test-Path $c) { return $c } }
+    foreach ($k in @(
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+        $hit = Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Qoder*' } | Select-Object -First 1
+        if ($hit -and $hit.DisplayIcon) {
+            return (($hit.DisplayIcon -split ',')[0]).Trim().Trim('"')
+        }
+    }
+    return $null
+}
+
+# ==================== UIA 扫描 ====================
+function Get-AllElements {
+    $out = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $wins = @(Get-QoderWindows)
+    Write-Log DEBUG "Get-AllElements: 顶层窗口数 $($wins.Count)"
+    foreach ($w in $wins) {
+        try {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($w.Hwnd)
+            if (-not $root) { continue }
+            $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+            $stack = New-Object System.Collections.Stack
+            $stack.Push($root)
+            while ($stack.Count -gt 0) {
+                $el = $stack.Pop()
+                try {
+                    $cur = $el.Current
+                    $rid = ''
+                    try { $rid = ($el.GetRuntimeId() -join '.') } catch { }
+                    if (-not $rid) { $rid = "$($w.Hwnd):$($cur.Name):$($cur.BoundingRectangle)" }
+                    if ($seen.Add($rid)) {
+                        $out.Add([pscustomobject]@{
+                            Element = $el
+                            Type = ($cur.ControlType.ProgrammaticName -replace 'ControlType\.', '')
+                            Name = [string]$cur.Name
+                            Rect = $cur.BoundingRectangle
+                            Offscreen = $cur.IsOffscreen
+                            Enabled = $cur.IsEnabled
+                            Hwnd = $w.Hwnd
+                            WinTitle = $w.Title
+                        })
+                    }
+                    $child = $walker.GetFirstChild($el)
+                    while ($child) { $stack.Push($child); $child = $walker.GetNextSibling($child) }
+                } catch { }
+            }
+        } catch { }
+    }
+    return $out
+}
+
+function Get-RightsDialog {
+    param($Elements)
+    $cands = @($Elements | Where-Object {
+        $_.Type -eq 'Window' -and -not $_.Offscreen -and -not $_.Rect.IsEmpty -and
+        $_.Name -match $RightsDialogRegex -and $_.Rect.Width -gt 300 -and $_.Rect.Height -gt 300
+    })
+    if ($cands.Count -eq 0) { return $null }
+    return ($cands | Sort-Object { $_.Rect.Width * $_.Rect.Height } -Descending | Select-Object -First 1)
+}
+
+function Find-RightsMenuItem {
+    param($Elements)
+    $cands = @($Elements | Where-Object {
+        $_.Name -match $RightsEntryRegex -and -not $_.Offscreen -and -not $_.Rect.IsEmpty -and
+        (($_.Type -eq 'MenuItem') -or ($_.Type -eq 'Button' -and $_.Rect.Width -lt 500 -and $_.Rect.Height -lt 100))
+    })
+    if ($cands.Count -eq 0) { return $null }
+    return ($cands | Sort-Object `
+        @{ Expression = { if ($_.Type -eq 'MenuItem') { 0 } else { 1 } } }, `
+        @{ Expression = { $_.Rect.Width * $_.Rect.Height } } | Select-Object -First 1)
+}
+
+function Find-MenuButton {
+    param($Elements)
+    $cands = @($Elements | Where-Object {
+        $_.Type -eq 'Button' -and $_.Name -match $MenuButtonRegex -and -not $_.Offscreen -and
+        -not $_.Rect.IsEmpty -and $_.Rect.Width -ge 20 -and $_.Rect.Height -ge 20
+    })
+    if ($cands.Count -eq 0) { return $null }
+    # 新版有两个: 左下角整块用户区(宽 372)和 30x30 小按钮; 优先整块区域
+    return ($cands | Sort-Object `
+        @{ Expression = { if ($_.Rect.Width -ge 300) { 0 } else { 1 } } }, `
+        @{ Expression = { $_.Rect.Width * $_.Rect.Height } } | Select-Object -First 1)
+}
+
+function Test-InRect {
+    param($Inner, $Outer)
+    if ($null -eq $Inner -or $null -eq $Outer -or $Inner.IsEmpty -or $Outer.IsEmpty) { return $false }
+    $tol = 2
+    return ($Inner.X -ge ($Outer.X - $tol) -and
+            $Inner.Y -ge ($Outer.Y - $tol) -and
+            ($Inner.X + $Inner.Width) -le ($Outer.X + $Outer.Width + $tol) -and
+            ($Inner.Y + $Inner.Height) -le ($Outer.Y + $Outer.Height + $tol))
+}
+
+function Get-ClaimButton {
+    param($Elements, $DialogRect)
+    $cands = @($Elements | Where-Object {
+        $_.Type -eq 'Button' -and $_.Name -match $ClaimRegex -and -not $_.Offscreen -and
+        (Test-InRect $_.Rect $DialogRect)
+    })
+    if ($cands.Count -eq 0) { return $null }
+    return ($cands | Sort-Object { $_.Rect.Width * $_.Rect.Height } | Select-Object -First 1)
+}
+
+function Get-ClaimedEvidence {
+    param($Elements, $DialogRect)
+    $cands = @($Elements | Where-Object {
+        $_.Name -and $_.Name -match $ClaimedRegex -and -not $_.Offscreen -and
+        ($_.Type -in @('Button', 'Text', 'StatusBar', 'Pane')) -and
+        (Test-InRect $_.Rect $DialogRect)
+    })
+    if ($cands.Count -eq 0) { return $null }
+    $best = $cands | Sort-Object `
+        @{ Expression = { if ($_.Type -eq 'Button') { 0 } else { 1 } } }, `
+        @{ Expression = { $_.Rect.Width * $_.Rect.Height } } | Select-Object -First 1
+    return $best.Name
+}
+
+function Get-SuccessToast {
+    param($Elements)
+    # 领取成功后可能出现短暂 toast/StatusBar; 只接受小尺寸、短文本, 避免误匹配聊天大段内容
+    $cands = @($Elements | Where-Object {
+        $_.Name -and $_.Name -match '领取成功|Credits 已到账' -and -not $_.Offscreen -and
+        $_.Name.Length -lt 80 -and -not $_.Rect.IsEmpty -and
+        ($_.Type -in @('Button', 'Text', 'StatusBar')) -and
+        ($_.Rect.Width * $_.Rect.Height) -lt 200000
+    })
+    if ($cands.Count -eq 0) { return $null }
+    return ($cands | Select-Object -First 1).Name
+}
+
+# ==================== 点击 ====================
+function Invoke-Click {
+    param($Element, [switch]$ForceMouse, [int]$OffsetX = -1)
+    try {
+        $cur = $Element.Current
+        $name = [string]$cur.Name
+        $rect = $cur.BoundingRectangle
+    } catch {
+        Write-Log WARN '无法读取控件坐标, 跳过点击'
+        return $false
+    }
+    if ($rect.IsEmpty -or $rect.Width -lt 2 -or $rect.Height -lt 2) {
+        Write-Log WARN "控件坐标无效, 跳过点击: [$name]"
+        return $false
+    }
+    if ($OffsetX -ge 0 -and $OffsetX -lt $rect.Width) {
+        $x = [int]($rect.X + $OffsetX)
+    } else {
+        $x = [int]($rect.X + $rect.Width / 2)
+    }
+    $y = [int]($rect.Y + $rect.Height / 2)
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    if ($x -lt $vs.Left -or $y -lt $vs.Top -or $x -ge ($vs.Left + $vs.Width) -or $y -ge ($vs.Top + $vs.Height)) {
+        Write-Log WARN "控件中心 ($x,$y) 超出屏幕, 跳过点击: [$name]"
+        return $false
+    }
+
+    $pt = New-Object Native.Win32+POINT
+    $pt.X = $x; $pt.Y = $y
+    $hit = [Native.Win32]::WindowFromPoint($pt)
+    $root = [Native.Win32]::GetAncestor($hit, 2)
+    $wpid = 0
+    [void][Native.Win32]::GetWindowThreadProcessId($root, [ref]$wpid)
+    if (-not (Test-QoderPid ([int]$wpid))) {
+        Write-Log WARN "坐标 ($x,$y) 处不是 Qoder 窗口(pid=$wpid), 跳过点击: [$name]"
+        return $false
+    }
+
+    if (-not $ForceMouse) {
+        try {
+            $pattern = $null
+            if ($Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+                $pattern.Invoke()
+                Write-Log INFO "[invoke] $name"
+                return $true
+            }
+        } catch { }
+    }
+
+    [void][Native.Win32]::SetCursorPos($x, $y)
+    Start-Sleep -Milliseconds 120
+    [Native.Win32]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 60
+    [Native.Win32]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+    Write-Log INFO "[click] 鼠标点击 ($x,$y) rect=($([int]$rect.X),$([int]$rect.Y) $([int]$rect.Width)x$([int]$rect.Height)) name=[$name]"
+    return $true
+}
+
+function Close-RightsDialog {
+    param($Elements, $DialogRect)
+    $closeNames = @('关闭活动', '关闭')
+    $cands = @($Elements | Where-Object {
+        $_.Type -eq 'Button' -and $_.Name -in $closeNames -and -not $_.Offscreen -and
+        (Test-InRect $_.Rect $DialogRect)
+    })
+    if ($cands.Count -eq 0) { return }
+    $btn = $cands | Sort-Object @{ Expression = { if ($_.Name -eq '关闭活动') { 0 } else { 1 } } } | Select-Object -First 1
+    try {
+        $pattern = $null
+        if ($btn.Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+            $pattern.Invoke()
+            Write-Log INFO "关闭权益活动弹层: [$($btn.Name)]"
+            return
+        }
+    } catch { }
+    [void](Invoke-Click $btn.Element -ForceMouse)
+    Write-Log INFO "关闭权益活动弹层: [$($btn.Name)]"
 }
 
 # ==================== 主流程 ====================
 Write-Log INFO ('===== 启动 (DryRun={0}, DumpTree={1}) =====' -f [bool]$DryRun, [bool]$DumpTree)
 
-# 领取窗口以每天 10:00 为界(10:00 前属于前一天窗口), 标记按窗口日期记录,
-# 避免凌晨检测到上一窗口的「已领取」后误写当天标记、挡掉 10:00 刷新后的真正领取
-function Get-ClaimWindowKey {
-    $now = Get-Date
-    $refreshAt = Get-Date -Hour $RefreshHour -Minute $RefreshMinute -Second 0
-    if ($now -lt $refreshAt) { $refreshAt = $refreshAt.AddDays(-1) }
-    return $refreshAt.ToString('yyyy-MM-dd')
-}
-$windowKey = Get-ClaimWindowKey
-if (-not $DumpTree -and (Test-Path $MarkerFile)) {
-    $last = (Get-Content $MarkerFile -Raw -ErrorAction SilentlyContinue)
-    if ($last -and $last.Trim() -eq $windowKey) {
-        Write-Log INFO "标记文件显示当前领取窗口($windowKey)已处理, 直接退出"
+$markerKey = Get-ClaimWindowKey
+if (-not $DryRun -and -not $DumpTree -and (Test-Path $MarkerFile)) {
+    $saved = ([string](Get-Content -Raw -Path $MarkerFile)).Trim()
+    if ($saved -eq $markerKey) {
+        Write-Log INFO "标记文件显示当前领取窗口($markerKey)已处理, 直接退出"
         exit 0
     }
 }
 
-# 等待每日领取窗口
 $now = Get-Date
-$claimAt = Get-Date -Hour $ClaimHour -Minute $ClaimMinute -Second 0
-if (-not $DumpTree -and $now -lt $claimAt) {
-    $waitMin = ($claimAt - $now).TotalMinutes
-    if ($waitMin -gt $MaxWaitMinutes) {
-        Write-Log WARN "距领取开放还有 $([int]$waitMin) 分钟, 超过等待上限 $MaxWaitMinutes 分钟, 退出(由每日定时触发兜底)"
+$claimAt = Get-Date -Year $now.Year -Month $now.Month -Day $now.Day -Hour $ClaimHour -Minute $ClaimMinute -Second 0
+if (-not $DryRun -and -not $DumpTree -and $now -lt $claimAt) {
+    $waitMinutes = [math]::Round(($claimAt - $now).TotalMinutes, 1)
+    if ($waitMinutes -gt $MaxWaitMinutes) {
+        Write-Log INFO "未到 $($claimAt.ToString('HH:mm')), 还有 $waitMinutes 分钟, 超过等待上限 $MaxWaitMinutes 分钟, 退出"
         exit 2
     }
     Write-Log INFO "未到 $($claimAt.ToString('HH:mm')), 等待中..."
     while ((Get-Date) -lt $claimAt) { Start-Sleep -Seconds 30 }
 }
-# 等待可能跨越 10:00 刷新点, 重新计算当前窗口
 $windowKey = Get-ClaimWindowKey
 
-# 定位 Qoder 进程与 exe
-$proc = Get-Process -Name $QoderProcName -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-$exe = $null
-if ($proc -and $proc.Path) { $exe = $proc.Path }
-if (-not $exe -and $ExePath) {
-    if (Test-Path $ExePath) { $exe = $ExePath } else { Write-Log WARN "-ExePath 不存在: $ExePath" }
-}
-if (-not $exe) {
-    foreach ($c in $ExeCandidates) { if (Test-Path $c) { $exe = $c; break } }
-}
-if (-not $exe) {
-    foreach ($k in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                     'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                     'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
-        $hit = Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Qoder*' } | Select-Object -First 1
-        if ($hit -and $hit.DisplayIcon) { $exe = ($hit.DisplayIcon -split ',')[0]; break }
+# 定位 Qoder 主窗口
+$main = Get-QoderMainWindow
+if (-not $main) {
+    $exe = Find-QoderExe
+    $proc = Get-Process -Name $QoderProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $proc) {
+        if (-not $exe) {
+            Write-Log ERROR '找不到 Qoder.exe, 请用 -ExePath 指定路径'
+            exit 4
+        }
+        Write-Log INFO "Qoder 未运行, 启动: $exe (带辅助功能参数)"
+        Start-Process -FilePath $exe -ArgumentList '--force-renderer-accessibility'
+    }
+    for ($i = 1; $i -le 60; $i++) {
+        Start-Sleep -Seconds 1
+        $main = Get-QoderMainWindow
+        if ($main) { break }
     }
 }
-if (-not $exe) { Write-Log ERROR '找不到 Qoder.exe, 请用 -ExePath 指定路径'; exit 4 }
+if (-not $main) {
+    Write-Log ERROR '等待 Qoder 主窗口超时'
+    Save-Screenshot
+    exit 4
+}
+$script:MainWindow = $main
+Write-Log INFO "Qoder 主窗口: hwnd=$($main.Hwnd) pid=$($main.Pid) rect=$($main.Left),$($main.Top) $($main.Width)x$($main.Height)"
 
-if (-not $proc) {
-    Write-Log INFO "Qoder 未运行, 启动: $exe (带辅助功能参数)"
-    Start-Process -FilePath $exe -ArgumentList '--force-renderer-accessibility'
+# 注册 UIA 焦点事件, 让 Chromium 保持辅助功能树
+$script:focusHandler = [System.Windows.Automation.AutomationFocusChangedEventHandler] {
+    param($sender, $e)
+}
+try { [System.Windows.Automation.Automation]::AddAutomationFocusChangedEventHandler($script:focusHandler) } catch { }
+
+$activated = Activate-Qoder $main
+if (-not $activated) {
+    Write-Log WARN 'Qoder 未能调到前台, 本轮不点击(点击前还会校验坐标处窗口归属)'
 }
 
-$deadline = (Get-Date).AddSeconds(120)
-$proc = $null
-while ($true) {
-    $proc = Get-Process -Name $QoderProcName -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-    if ($proc) { break }
-    if ((Get-Date) -gt $deadline) { Write-Log ERROR '等待 Qoder 主窗口超时'; Save-Screenshot; exit 4 }
-    Start-Sleep -Seconds 3
-}
-Write-Log INFO "Qoder 就绪: PID=$($proc.Id)"
-$script:QoderPid = $proc.Id
-
-# 注册 UIA 事件监听: 让 Chromium 检测到辅助功能客户端, 否则 a11y 树会在无客户端约 1 分钟后衰减
-$script:focusHandler = [System.Windows.Automation.AutomationFocusChangedEventHandler]{ param($s, $e) }
-[System.Windows.Automation.Automation]::AddAutomationFocusChangedEventHandler($script:focusHandler)
-
-# 激活 + 扫描 (最小化的 Chromium 窗口 a11y 树为空, 需要激活并等待重建)
 $all = @()
-for ($try = 1; $try -le 10; $try++) {
-    Activate-Qoder $proc.MainWindowHandle
-    $all = @(Get-AllElements -ProcId $proc.Id)
+for ($try = 1; $try -le 3; $try++) {
+    $all = @(Get-AllElements)
     Write-Log INFO "第 $try 次扫描: $($all.Count) 个元素"
     if ($all.Count -gt 20) { break }
     Start-Sleep -Seconds 10
 }
-[System.Windows.Automation.Automation]::RemoveAutomationFocusChangedEventHandler($script:focusHandler)
+try { [System.Windows.Automation.Automation]::RemoveAutomationFocusChangedEventHandler($script:focusHandler) } catch { }
 if ($all.Count -le 20) {
-    Write-Log WARN 'UIA 元素过少, a11y 树未重建; 放弃本次(明日定时任务会再试)'
+    Write-Log WARN 'UIA 元素过少, a11y 树未重建; 放弃本次'
     Save-Screenshot
     exit 4
 }
 
 if ($DumpTree) { Write-Dump $all; exit 0 }
 
-# ---- 定位/打开权益活动弹层 ----
+# ---- 打开/定位权益活动弹层 ----
 $dialog = Get-RightsDialog $all
 $openedByUs = $false
 
@@ -425,29 +581,27 @@ if (-not $dialog) {
         exit 0
     }
     for ($attempt = 1; $attempt -le 3 -and -not $dialog; $attempt++) {
-        Activate-Qoder $proc.MainWindowHandle
-        if (-not (Test-QoderForeground $proc.Id)) {
+        if (-not (Activate-Qoder $main)) {
             Write-Log WARN 'Qoder 未能调到前台, 本轮不点击(点击前还会校验坐标处窗口归属)'
             Start-Sleep -Seconds 2
             continue
         }
-        # 菜单若已打开(上一轮点开了但没点中菜单项), 直接找菜单项, 避免再点一次把它关掉
-        $menuItem = Find-Interactive $all $RightsEntryRegex -SkipNoClickFilter
+        $menuItem = Find-RightsMenuItem $all
         if (-not $menuItem) {
-            $menuBtn = Find-Interactive $all $MenuButtonRegex
+            $menuBtn = Find-MenuButton $all
             if (-not $menuBtn) {
                 Write-Log WARN '找不到左下角「打开用户菜单」按钮, 界面可能改版; 控件树留证'
                 Write-Dump $all
                 Save-Screenshot
                 break
             }
-            Write-Log INFO "第 $attempt 次打开用户菜单: [$(Get-CName $menuBtn)]"
-            if (-not (Invoke-Click $menuBtn -ForceMouse)) { Start-Sleep -Seconds 2; continue }
+            Write-Log INFO "第 $attempt 次打开用户菜单: [$($menuBtn.Name)]"
+            if (-not (Invoke-Click $menuBtn.Element -ForceMouse -OffsetX 80)) { Start-Sleep -Seconds 2; continue }
             $openedByUs = $true
             for ($i = 1; $i -le 5; $i++) {
                 Start-Sleep -Seconds 2
-                $all = @(Get-AllElements -ProcId $proc.Id)
-                $menuItem = Find-Interactive $all $RightsEntryRegex -SkipNoClickFilter
+                $all = @(Get-AllElements)
+                $menuItem = Find-RightsMenuItem $all
                 if ($menuItem) { break }
             }
             if (-not $menuItem) {
@@ -455,19 +609,18 @@ if (-not $dialog) {
                 continue
             }
         }
-        Write-Log INFO "点击权益中心: [$(Get-CName $menuItem)]"
-        if (-not (Invoke-Click $menuItem -ForceMouse)) { Start-Sleep -Seconds 2; continue }
+        Write-Log INFO "点击权益中心: [$($menuItem.Name)] rect=($([int]$menuItem.Rect.X),$([int]$menuItem.Rect.Y) $([int]$menuItem.Rect.Width)x$([int]$menuItem.Rect.Height))"
+        if (-not (Invoke-Click $menuItem.Element -ForceMouse)) { Start-Sleep -Seconds 2; continue }
         $openedByUs = $true
-        # 弹层是独立 HWND, 加载需要时间(会先显示「正在加载活动…」)
         for ($i = 1; $i -le 15; $i++) {
             Start-Sleep -Seconds 2
-            $all = @(Get-AllElements -ProcId $proc.Id)
+            $all = @(Get-AllElements)
             $dialog = Get-RightsDialog $all
             if ($dialog) { Write-Log INFO "权益活动弹层已打开(第 $i 次检测)"; break }
         }
         if (-not $dialog) {
             Write-Log WARN '点击权益中心后未出现权益活动弹层'
-            $all = @(Get-AllElements -ProcId $proc.Id)
+            $all = @(Get-AllElements)
         }
     }
 }
@@ -476,123 +629,89 @@ if (-not $dialog) {
     exit 0
 }
 
-# 等待弹层内容加载: 直到出现「领取」按钮或「已领取」证据
+# ---- 等待弹层内容: 领取按钮 或 已领取证据 ----
 $claimBtn = $null
 $evidence = $null
-$dr = $null
+$dialogRect = $null
 for ($i = 1; $i -le 20; $i++) {
     $dialog = Get-RightsDialog $all
     if (-not $dialog) { break }
-    $dr = $dialog.Current.BoundingRectangle
-    $claimBtn = Get-ClaimButton $all $dr
-    $evidence = Get-ClaimedEvidence $all $dr
+    $dialogRect = $dialog.Rect
+    $claimBtn = Get-ClaimButton $all $dialogRect
+    $evidence = Get-ClaimedEvidence $all $dialogRect
     if ($claimBtn -or $evidence) { break }
     Start-Sleep -Seconds 2
-    $all = @(Get-AllElements -ProcId $proc.Id)
+    $all = @(Get-AllElements)
 }
 $dialog = Get-RightsDialog $all
 if (-not $dialog) {
-    Write-Log WARN '权益活动弹层在加载过程中关闭, 无法判断领取状态; 不写标记'
-    Write-Dump $all
-    Save-Screenshot
+    Write-Log WARN '权益活动弹层在等待内容时消失'
     exit 3
 }
-$dr = $dialog.Current.BoundingRectangle
+$dialogRect = $dialog.Rect
 
-function Close-RightsDialog {
-    param($ProcId)
-    if ($DryRun) { return }
-    $els = @(Get-AllElements -ProcId $ProcId)
-    $dlg = Get-RightsDialog $els
-    if (-not $dlg) { return }
-    $rect = $dlg.Current.BoundingRectangle
-    $btn = $null
-    foreach ($e in $els) {
-        try {
-            $c = $e.Current
-            if ($c.ControlType.ProgrammaticName -ne 'ControlType.Button') { continue }
-            if ([string]$c.Name -notmatch '^关闭活动$|^关闭$') { continue }
-            if (-not (Test-InRect $c.BoundingRectangle $rect)) { continue }
-            $btn = $e; break
-        } catch { }
+if ($evidence) {
+    $now = Get-Date
+    if ($now -lt (Get-TodayRefreshAt)) {
+        Write-Log INFO "检测到已领取文案 [$evidence], 但当前仍在上一领取窗口, 不写标记"
+    } elseif ($DryRun) {
+        Write-Log INFO "[DryRun] 检测到已领取文案 [$evidence], 当前窗口($windowKey)已完成; 不写标记"
+    } else {
+        Write-Log INFO "检测到已领取文案 [$evidence], 当前窗口($windowKey)已完成, 写标记退出"
+        Set-ClaimedMarker $windowKey
     }
-    if ($btn) {
-        Write-Log INFO "关闭权益活动弹层: [$(Get-CName $btn)]"
-        $null = Invoke-Click $btn
-    }
+    if ($openedByUs) { Close-RightsDialog $all $dialogRect }
+    exit 0
 }
 
-# 情况 A: 已领取(可能是本轮之前已手动领取, 或上一窗口状态)
-if (-not $claimBtn -and $evidence) {
-    $refreshAt = Get-Date -Hour $RefreshHour -Minute $RefreshMinute -Second 0
-    if ((Get-Date) -ge $refreshAt) {
-        Write-Log INFO "检测到已领取文案 [$evidence], 当前窗口($windowKey)已完成, 写标记退出"
-        Set-ClaimedMarker
-        if ($openedByUs) { Close-RightsDialog $proc.Id }
+if ($claimBtn) {
+    if ($DryRun) {
+        Write-Log INFO "[DryRun] 找到领取按钮 [$($claimBtn.Name)], 不点击"
         exit 0
     }
-    Write-Log INFO "检测到已领取文案 [$evidence], 但当前未到 $($refreshAt.ToString('HH:mm')) 刷新, 属于上一窗口, 不写标记"
-    if ($openedByUs) { Close-RightsDialog $proc.Id }
-    exit 0
-}
-
-# 情况 B: 弹层已加载但没有领取入口, 也不是已领取
-if (-not $claimBtn) {
-    Write-Log WARN '权益活动弹层未出现「领取」或「已领取」, 页面可能未加载完成或界面改版; 不写标记'
-    Write-Dump $all
-    Save-Screenshot
-    if ($openedByUs) { Close-RightsDialog $proc.Id }
-    exit 3
-}
-
-# 情况 C: 可领取
-if ($DryRun) {
-    Write-Log INFO "[DryRun] 将在权益活动弹层点击领取: [$(Get-CName $claimBtn)]"
-    exit 0
-}
-
-$clicked = $false
-for ($round = 1; $round -le 2 -and -not $clicked; $round++) {
-    Activate-Qoder $proc.MainWindowHandle
-    if (-not (Test-QoderForeground $proc.Id)) {
-        Write-Log WARN 'Qoder 未能调到前台, 本轮不点击(点击前还会校验坐标处窗口归属)'
-        Start-Sleep -Seconds 2
-        continue
+    $success = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $success; $attempt++) {
+        $dialog = Get-RightsDialog $all
+        if (-not $dialog) { break }
+        $dialogRect = $dialog.Rect
+        $claimBtn = Get-ClaimButton $all $dialogRect
+        if (-not $claimBtn) { break }
+        Write-Log INFO "第 $attempt 次点击领取按钮: [$($claimBtn.Name)]"
+        if (-not (Invoke-Click $claimBtn.Element -ForceMouse)) {
+            Start-Sleep -Seconds 2
+            $all = @(Get-AllElements)
+            continue
+        }
+        for ($i = 1; $i -le 8; $i++) {
+            Start-Sleep -Seconds 2
+            $all = @(Get-AllElements)
+            $dialog = Get-RightsDialog $all
+            $evidence = $null
+            if ($dialog) {
+                $dialogRect = $dialog.Rect
+                $evidence = Get-ClaimedEvidence $all $dialogRect
+            }
+            if (-not $evidence) { $evidence = Get-SuccessToast $all }
+            if ($evidence) { $success = $true; break }
+        }
+        if (-not $success) { $all = @(Get-AllElements) }
     }
-    Write-Log INFO "第 $round 次点击领取按钮: [$(Get-CName $claimBtn)]"
-    if (Invoke-Click $claimBtn -ForceMouse) { $clicked = $true }
-}
-
-if (-not $clicked) {
-    Write-Log WARN '领取按钮点击失败; 截图+控件树留证'
-    Write-Dump $all
+    if ($success) {
+        Write-Log INFO "检测到已领取文案 [$evidence], 领取成功, 写标记"
+        Set-ClaimedMarker $windowKey
+        if ($openedByUs) {
+            $dialog = Get-RightsDialog $all
+            if ($dialog) { Close-RightsDialog $all $dialog.Rect }
+        }
+        exit 0
+    }
+    Write-Log WARN '点击领取后未检测到「已领取/领取成功」证据, 结果未知; 不写标记; 截图+控件树留证'
     Save-Screenshot
-    if ($openedByUs) { Close-RightsDialog $proc.Id }
+    Write-Dump $all
     exit 3
 }
 
-# 等待明确的领取成功证据(绝不把"按钮消失"直接当成功)
-$evidence = $null
-for ($i = 1; $i -le 8; $i++) {
-    Start-Sleep -Seconds 2
-    $all = @(Get-AllElements -ProcId $proc.Id)
-    $dialog = Get-RightsDialog $all
-    if (-not $dialog) { break }
-    $dr = $dialog.Current.BoundingRectangle
-    $evidence = Get-ClaimedEvidence $all $dr
-    if ($evidence) { break }
-    $claimBtn = Get-ClaimButton $all $dr
-    Write-Log INFO ("第 {0} 次复核: 领取按钮={1} 成功文案=[{2}]" -f $i, [bool]$claimBtn, $evidence)
-}
-if ($evidence) {
-    Write-Log INFO "检测到已领取文案 [$evidence], 领取成功, 写标记"
-    Set-ClaimedMarker
-    if ($openedByUs) { Close-RightsDialog $proc.Id }
-    exit 0
-}
-
-Write-Log WARN '点击领取后未检测到「已领取/领取成功」证据, 结果未知; 不写标记; 截图+控件树留证'
-Write-Dump $all
+Write-Log WARN '权益活动弹层里既没有「领取」按钮, 也没有「已领取」证据; 不写标记, 等待下轮重试'
 Save-Screenshot
-if ($openedByUs) { Close-RightsDialog $proc.Id }
+Write-Dump $all
 exit 3
