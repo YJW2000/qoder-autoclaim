@@ -25,6 +25,9 @@ Qoder自动签到脚本 (Qoder AutoClaim) - Qoder 每日积分自动领取
   - 前台/点击安全校验改为按进程名 Qoder 判断(接受全部 Qoder 进程), 不再要求 PID 完全相等。
   - 菜单项只接受可见的 MenuItem(或小尺寸 Button), 不再用大段聊天文本匹配「权益中心」。
   - 兼容旧弹层名「权益活动内容」和新标题「专属活动权益」。
+  - 激活修复 (2026-10-26): 用实时窗口状态还原最小化/屏幕外窗口; 先按 Esc 关闭快速设置等
+    系统浮层; SetForegroundWindow/AttachThreadInput/SwitchToThisWindow 都失败时, 临时置顶
+    并真实点击标题栏激活, 完成后取消置顶; 激活前后前台窗口写入日志。
 #>
 param(
     [switch]$DryRun,
@@ -53,6 +56,10 @@ public static class Win32 {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
+  [DllImport("user32.dll")] public static extern IntPtr SetActiveWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hWnd, bool unknown);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
   [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
@@ -250,27 +257,138 @@ function Test-QoderForeground {
 function Activate-Qoder {
     param($Main)
     if ($null -eq $Main -or $Main.Hwnd -eq [IntPtr]::Zero) { return $false }
-    if ($Main.Iconic) { [void][Native.Win32]::ShowWindow($Main.Hwnd, 9) }
-    if (-not [Native.Win32]::IsWindowVisible($Main.Hwnd)) { [void][Native.Win32]::ShowWindow($Main.Hwnd, 5) }
 
-    $fg = Get-ForegroundInfo
-    if ($fg.Root -eq $Main.Hwnd) { return $true }
+    $fg0 = Get-ForegroundInfo
+    $r0 = New-Object Native.Win32+RECT
+    [void][Native.Win32]::GetWindowRect($Main.Hwnd, [ref]$r0)
+    $w0 = $r0.Right - $r0.Left
+    $h0 = $r0.Bottom - $r0.Top
+    $iconic0 = [Native.Win32]::IsIconic($Main.Hwnd)
+    $offscreen0 = ($r0.Left -le -30000 -or $r0.Top -le -30000 -or $w0 -lt 100 -or $h0 -lt 100)
+    Write-Log INFO "激活前前台: pid=$($fg0.Pid) title=[$($fg0.Title)]; Qoder iconic=$iconic0 rect=$($r0.Left),$($r0.Top) ${w0}x${h0}"
 
-    # ALT 解除前台锁定; AttachThreadInput 提高 SetForegroundWindow 成功率
-    [Native.Win32]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
-    [Native.Win32]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
-    $fgPid = 0
-    $fgThread = [Native.Win32]::GetWindowThreadProcessId([Native.Win32]::GetForegroundWindow(), [ref]$fgPid)
-    $curThread = [Native.Win32]::GetCurrentThreadId()
-    $attached = $false
-    if ($fgThread -ne 0 -and $fgThread -ne $curThread) {
-        $attached = [Native.Win32]::AttachThreadInput($curThread, $fgThread, $true)
+    # 快速设置/开始菜单等系统浮层会占住前台并阻止切换, 先 Esc 关闭
+    [Native.Win32]::keybd_event(0x1B, 0, 0, [UIntPtr]::Zero)
+    [Native.Win32]::keybd_event(0x1B, 0, 2, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 200
+
+    if ($iconic0 -or $offscreen0) {
+        Write-Log INFO 'Qoder 窗口最小化/在屏幕外, 尝试还原'
+        [void][Native.Win32]::ShowWindow($Main.Hwnd, 9)
+        [void][Native.Win32]::ShowWindow($Main.Hwnd, 5)
+        Start-Sleep -Milliseconds 800
     }
-    [void][Native.Win32]::SetForegroundWindow($Main.Hwnd)
-    [void][Native.Win32]::BringWindowToTop($Main.Hwnd)
-    if ($attached) { [void][Native.Win32]::AttachThreadInput($curThread, $fgThread, $false) }
-    Start-Sleep -Milliseconds 500
-    return (Test-QoderForeground)
+    if (-not [Native.Win32]::IsWindowVisible($Main.Hwnd)) {
+        [void][Native.Win32]::ShowWindow($Main.Hwnd, 5)
+        Start-Sleep -Milliseconds 500
+    }
+
+    # ShowWindow 对某些 Chromium 隐藏态不挪位置, 仍在屏幕外时强制放到可见区域
+    [void][Native.Win32]::GetWindowRect($Main.Hwnd, [ref]$r0)
+    $w0 = $r0.Right - $r0.Left
+    $h0 = $r0.Bottom - $r0.Top
+    if ($r0.Left -le -30000 -or $r0.Top -le -30000 -or $w0 -lt 100 -or $h0 -lt 100) {
+        $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+        $nw = [Math]::Min(1600, $vs.Width - 200)
+        $nh = [Math]::Min(1000, $vs.Height - 200)
+        [void][Native.Win32]::SetWindowPos($Main.Hwnd, [IntPtr]::Zero, $vs.Left + 100, $vs.Top + 100, $nw, $nh, 0x0040)
+        Write-Log INFO "Qoder 窗口仍在屏幕外, 已移动到 ($($vs.Left + 100),$($vs.Top + 100)) ${nw}x${nh}"
+        Start-Sleep -Milliseconds 500
+    }
+
+    if (Test-QoderForeground) { return $true }
+
+    # 先把窗口提到普通窗口层最前, 再尝试 SetForegroundWindow/SwitchToThisWindow
+    try { [void][Native.Win32]::SetWindowPos($Main.Hwnd, [IntPtr]::Zero, 0, 0, 0, 0, 0x0043) } catch { }
+    Start-Sleep -Milliseconds 200
+
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        [Native.Win32]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        [Native.Win32]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        $fgPid = 0
+        $fgThread = [Native.Win32]::GetWindowThreadProcessId([Native.Win32]::GetForegroundWindow(), [ref]$fgPid)
+        $curThread = [Native.Win32]::GetCurrentThreadId()
+        $attached = $false
+        if ($fgThread -ne 0 -and $fgThread -ne $curThread) {
+            $attached = [Native.Win32]::AttachThreadInput($curThread, $fgThread, $true)
+        }
+        [void][Native.Win32]::SetForegroundWindow($Main.Hwnd)
+        [void][Native.Win32]::BringWindowToTop($Main.Hwnd)
+        [void][Native.Win32]::SetActiveWindow($Main.Hwnd)
+        [void][Native.Win32]::SetFocus($Main.Hwnd)
+        try { [Native.Win32]::SwitchToThisWindow($Main.Hwnd, $true) } catch { }
+        if ($attached) { [void][Native.Win32]::AttachThreadInput($curThread, $fgThread, $false) }
+        Start-Sleep -Milliseconds 500
+        if (Test-QoderForeground) {
+            Write-Log INFO "Qoder 已调到前台(第 $attempt 次尝试)"
+            return $true
+        }
+        Write-Log WARN "第 $attempt 次强制切换前台未生效"
+        Start-Sleep -Milliseconds 300
+    }
+
+    # 最后兜底: 临时置顶 Qoder, 再真实点击标题栏; 点击是真实用户输入, 可解除前台锁定
+    $topmost = $false
+    $result = $false
+    try {
+        try {
+            [void][Native.Win32]::SetWindowPos($Main.Hwnd, [IntPtr]::new(-1), 0, 0, 0, 0, 0x0043)
+            $topmost = $true
+            Write-Log INFO '已将 Qoder 临时置顶以解除遮挡'
+        } catch {
+            Write-Log WARN "临时置顶失败: $($_.Exception.Message)"
+        }
+        Start-Sleep -Milliseconds 300
+        [Native.Win32]::keybd_event(0x1B, 0, 0, [UIntPtr]::Zero)
+        [Native.Win32]::keybd_event(0x1B, 0, 2, [UIntPtr]::Zero)
+        try { [void][Native.Win32]::SetForegroundWindow($Main.Hwnd) } catch { }
+        try { [Native.Win32]::SwitchToThisWindow($Main.Hwnd, $true) } catch { }
+        Start-Sleep -Milliseconds 300
+        if (Test-QoderForeground) {
+            Write-Log INFO 'Qoder 已通过临时置顶激活'
+            $result = $true
+        } else {
+            [void][Native.Win32]::GetWindowRect($Main.Hwnd, [ref]$r0)
+            $w0 = $r0.Right - $r0.Left
+            $h0 = $r0.Bottom - $r0.Top
+            if ($w0 -gt 200 -and $h0 -gt 200) {
+                $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+                $x = [int]($r0.Left + $w0 / 2)
+                $y = [int]($r0.Top + 20)
+                if ($x -lt $vs.Left + 2) { $x = $vs.Left + 2 }
+                if ($x -ge $vs.Left + $vs.Width - 2) { $x = $vs.Left + $vs.Width - 3 }
+                if ($y -lt $vs.Top + 2) { $y = $vs.Top + 2 }
+                if ($y -ge $vs.Top + $vs.Height - 2) { $y = $vs.Top + $vs.Height - 3 }
+                $pt = New-Object Native.Win32+POINT
+                $pt.X = $x; $pt.Y = $y
+                $hit = [Native.Win32]::WindowFromPoint($pt)
+                $root = [Native.Win32]::GetAncestor($hit, 2)
+                $wpid = 0
+                [void][Native.Win32]::GetWindowThreadProcessId($root, [ref]$wpid)
+                if (Test-QoderPid ([int]$wpid)) {
+                    Write-Log INFO "尝试点击 Qoder 标题栏激活 ($x,$y)"
+                    [void][Native.Win32]::SetCursorPos($x, $y)
+                    Start-Sleep -Milliseconds 120
+                    [Native.Win32]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+                    Start-Sleep -Milliseconds 60
+                    [Native.Win32]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+                    Start-Sleep -Milliseconds 500
+                    if (Test-QoderForeground) {
+                        Write-Log INFO 'Qoder 已通过标题栏点击激活'
+                        $result = $true
+                    }
+                } else {
+                    Write-Log WARN "标题栏点击坐标被其他窗口覆盖(pid=$wpid), 跳过"
+                }
+            }
+        }
+    } finally {
+        if ($topmost) {
+            try { [void][Native.Win32]::SetWindowPos($Main.Hwnd, [IntPtr]::new(-2), 0, 0, 0, 0, 0x0003) } catch { }
+            Write-Log INFO '已取消 Qoder 临时置顶'
+        }
+    }
+    return ($result -and (Test-QoderForeground))
 }
 
 function Find-QoderExe {
