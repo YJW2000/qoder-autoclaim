@@ -3,7 +3,7 @@
 > Qoder自动签到脚本：基于 Windows UI Automation 的 Qoder 桌面端每日积分自动领取工具。  
 > 不调用 Qoder 内部 API、不保存账号凭据，通过模拟真实点击完成领取。
 >
-> 已在 Qoder **0.4.11**（2026-10-24）上实测通过，兼容旧版 0.4.x。
+> 已在 Qoder **0.4.11**（2026-10-24）和 **0.5.1**（2026-10-31）上实测通过，兼容旧版 0.4.x。
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)](https://www.microsoft.com/windows)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1-5391FE)](https://learn.microsoft.com/powershell/)
@@ -23,7 +23,8 @@
 - 菜单项只接受可见的 `MenuItem`（或小尺寸 Button），不会把聊天区里含「权益中心」字样的大段文字当成入口
 - 幂等：只有拿到「已领取」按钮或「领取成功，Credits 已到账」的阳性证据时才写日期标记，当天不会重复领取
 - 不误判：权益弹层里既没有「领取」按钮、也没有「已领取」证据时**不写标记**，留给后续重试
-- 计划任务每天 10:05 触发，11:05、12:05 各重试一次；登录后 10 分钟再补跑一次
+- 计划任务 10:05 起每小时重试至 12:05，20:05 起重试至 22:05，23:05 再补跑；登录后 10 分钟、解锁后 1 分钟各补跑一次
+- Qoder 未运行时会从注册表和安装目录发现真正的 `Qoder.exe`，不会误启动 `uninstallerIcon.ico`
 - 失败自动留证：日志、UIA 控件树、屏幕截图
 - `-DryRun` 只读检测；`-DumpTree` 导出控件树，方便客户端改版后重新适配
 
@@ -33,8 +34,8 @@ Qoder 的每日积分入口位于桌面端左下角「打开用户菜单」→�
 
 1. 检查 `%LOCALAPPDATA%\QoderAutoClaim\last-claim.txt` 是否已是当前窗口，是则退出（`-DryRun` / `-DumpTree` 不受标记限制）
 2. 等待到配置的领取时间（默认 10:05；早于该时间触发且超过等待上限则退出 2）
-3. 枚举所有 Qoder 进程的可见顶层窗口，选择标题为 `Qoder`、面积最大的窗口作为主界面；未运行则以 `--force-renderer-accessibility` 启动
-4. 还原/激活主窗口，注册 UIA 焦点事件，让 Chromium 保持辅助功能树
+3. 枚举所有 Qoder 进程的可见顶层窗口，选择标题为 `Qoder`、面积最大的窗口作为主界面；未运行则从注册表/安装目录发现真正的 `Qoder.exe`（优先 `<root>\Qoder.exe`，其次 `<root>\.qoder-versions\*\Qoder.exe`）并以 `--force-renderer-accessibility` 启动
+4. 还原/激活主窗口（必要时 Esc 关闭系统浮层、临时置顶并点击标题栏），注册 UIA 焦点事件，让 Chromium 保持辅助功能树
 5. 用 `EnumWindows` 枚举全部可见顶层窗口，再用 `TreeWalker` 遍历控件树；新版 0.4.11 的权益弹层位于主窗口内，旧版可能是独立 HWND，两种都能扫描到
 6. 用真实鼠标点击左下角整块「打开用户菜单」区域，再点击菜单里可见的 `MenuItem`「权益中心，有权益待领取」
 7. 等待「权益活动内容 / 专属活动权益」弹层加载完成
@@ -111,7 +112,7 @@ $ClaimRegex        = '^领取$'
 $ClaimedRegex      = '已领取|领取成功|Credits 已到账|Claimed|明日再来|明天再来|今日已领'
 ```
 
-> Qoder 每日领取窗口实测为 **10:00（UTC+8）** 开放。默认计划任务在 **10:05** 首次运行，11:05、12:05 再各重试一次；如果首次运行时活动页尚未刷新，后两轮会补上。若以后开放时间变化，请同时调整 `$ClaimHour`/`$ClaimMinute`、`$RefreshHour`/`$RefreshMinute` 和 `Install-AutoClaimTask.ps1` 中的计划任务时间。
+> Qoder 每日领取窗口实测为 **10:00（UTC+8）** 开放。计划任务在 10:05–12:05、20:05–22:05 和 23:05 重试，并在登录/解锁后补跑；如果白天关机或休眠，晚间和次日 10:00 前仍有机会补领。若以后开放时间变化，请同时调整 `$ClaimHour`/`$ClaimMinute`、`$RefreshHour`/`$RefreshMinute` 和 `Install-AutoClaimTask.ps1` 中的计划任务时间。
 
 ## 计划任务
 
@@ -119,7 +120,10 @@ $ClaimedRegex      = '已领取|领取成功|Credits 已到账|Claimed|明日再
 
 - 每天 `10:05` 首次触发
 - 之后每小时重复一次，持续 2 小时（11:05、12:05），覆盖活动页刷新延迟或首次失败
+- 每天 `20:05` 起每小时重复一次，持续 2 小时（20:05、21:05、22:05），覆盖白天关机/休眠、晚上才回来的情况
+- 每天 `23:05` 再补跑一次（领取窗口持续到次日 10:00）
 - 用户登录后延迟 10 分钟补跑一次
+- 从睡眠/锁屏解锁后 1 分钟补跑一次
 - 单次执行上限 1 小时，已在运行时不重复启动
 - 使用 `wscript.exe` + `run-hidden.vbs` 隐藏窗口
 
@@ -184,12 +188,17 @@ Qoder 可能改版。先用 `-DumpTree` 导出 `uia-latest.txt`，根据实际�
 脚本在点击前会校验前台窗口属于 Qoder，并额外用 `WindowFromPoint` + 窗口 PID 校验点击坐标处确实属于 Qoder；菜单项只接受可见的 `MenuItem`，不会匹配聊天里的大段文字。任一检查失败就跳过本轮。请避免在运行时段用其他窗口完全遮挡 Qoder。
 
 **计划任务没有运行**  
-检查任务状态与上次结果：
+检查任务状态、触发器和上次结果：
 
 ```powershell
 Get-ScheduledTask -TaskName Qoder-AutoClaim | Format-List State
-Get-ScheduledTaskInfo -TaskName Qoder-AutoClaim | Format-List LastRunTime,LastTaskResult,NextRunTime
+(Get-ScheduledTask -TaskName Qoder-AutoClaim).Triggers | Format-List
+Get-ScheduledTaskInfo -TaskName Qoder-AutoClaim | Format-List LastRunTime,LastTaskResult,NextRunTime,NumberOfMissedRuns
 ```
+
+**日志提示「Qoder 未运行, 启动: ...uninstallerIcon.ico」/ 等待主窗口超时**
+
+旧版会把注册表 `DisplayIcon` 里的卸载图标当成 `Qoder.exe`。当前脚本只接受真正的 `Qoder.exe`，会从安装根目录、`DisplayIcon` 和 `UninstallString` 反推路径，并优先查找 `<root>\Qoder.exe` 与 `<root>\.qoder-versions\*\Qoder.exe`。若仍找不到，请用 `-ExePath` 指定实际路径。
 
 ## 安全与隐私
 
@@ -199,6 +208,12 @@ Get-ScheduledTaskInfo -TaskName Qoder-AutoClaim | Format-List LastRunTime,LastTa
 - 所有数据仅保存在本机 `%LOCALAPPDATA%\QoderAutoClaim\`
 
 ## 变更记录
+
+### 2026-10-31
+
+- **修复 Qoder 未运行时的启动路径**：注册表 `DisplayIcon` 指向 `D:\Qoder\uninstallerIcon.ico`，旧逻辑把它当作 `Qoder.exe` 启动，10/28–10/30 因此等待主窗口超时。现在从 `InstallLocation`、`DisplayIcon`、`UninstallString` 反推安装根目录，只接受真正的 `Qoder.exe`，优先 `<root>\Qoder.exe`，其次 `<root>\.qoder-versions\*\Qoder.exe`（最新版本）；无效路径不再尝试启动。
+- **增加补跑触发**：保留 10:05–12:05 重试，新增 20:05–22:05、23:05，以及登录 +10 分钟、解锁 +1 分钟补跑。今天 10:05 的任务本身未触发（`NumberOfMissedRuns: 2`），这些触发会在晚间或解锁时补上；任务已重新注册并验证 5 个触发器、手动启动返回 0。
+- **Qoder 0.5.1 实测**：2026-10-31 22:50 在 Qoder 0.5.1 上实跑领取成功，日志确认点击「领取」后检测到「已领取」，写入 `last-claim.txt = 2026-10-31`；随后再次运行命中标记直接退出。
 
 ### 2026-10-26
 

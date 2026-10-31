@@ -28,6 +28,9 @@ Qoder自动签到脚本 (Qoder AutoClaim) - Qoder 每日积分自动领取
   - 激活修复 (2026-10-26): 用实时窗口状态还原最小化/屏幕外窗口; 先按 Esc 关闭快速设置等
     系统浮层; SetForegroundWindow/AttachThreadInput/SwitchToThisWindow 都失败时, 临时置顶
     并真实点击标题栏激活, 完成后取消置顶; 激活前后前台窗口写入日志。
+  - 启动路径修复 (2026-10-31): 注册表 DisplayIcon 可能是 uninstallerIcon.ico, 不能直接启动。
+    现在从 InstallLocation/DisplayIcon/UninstallString 反推安装根目录, 只接受真正的 Qoder.exe,
+    优先 <root>\Qoder.exe, 再 <root>\.qoder-versions\*\Qoder.exe(取最新)。
 #>
 param(
     [switch]$DryRun,
@@ -391,18 +394,62 @@ function Activate-Qoder {
     return ($result -and (Test-QoderForeground))
 }
 
+function Test-QoderExePath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $p = $Path.Trim().Trim('"')
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return $false }
+    # 只接受真正的 Qoder.exe, 排除 uninstallerIcon.ico / Uninstall Qoder.exe 等
+    return ([System.IO.Path]::GetFileName($p) -ieq 'Qoder.exe')
+}
+
+function Get-QoderExeFromRoot {
+    param([string]$Root)
+    if ([string]::IsNullOrWhiteSpace($Root)) { return $null }
+    $rootPath = $Root.Trim().Trim('"')
+    if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) { return $null }
+    $direct = Join-Path $rootPath 'Qoder.exe'
+    if (Test-QoderExePath $direct) { return $direct }
+    $versions = Join-Path $rootPath '.qoder-versions'
+    if (Test-Path -LiteralPath $versions -PathType Container) {
+        $cands = @(Get-ChildItem -LiteralPath $versions -Filter 'Qoder.exe' -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { Test-QoderExePath $_.FullName } |
+            Sort-Object LastWriteTime -Descending)
+        if ($cands.Count -gt 0) { return $cands[0].FullName }
+    }
+    return $null
+}
+
 function Find-QoderExe {
-    if ($ExePath -and (Test-Path $ExePath)) { return $ExePath }
-    $p = Get-Process -Name $QoderProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($p -and $p.Path) { return $p.Path }
-    foreach ($c in $ExeCandidates) { if (Test-Path $c) { return $c } }
-    foreach ($k in @(
+    if (Test-QoderExePath $ExePath) { return $ExePath.Trim().Trim('"') }
+    $p = Get-Process -Name $QoderProcessName -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1
+    if ($p -and (Test-QoderExePath $p.Path)) { return $p.Path }
+    foreach ($c in $ExeCandidates) { if (Test-QoderExePath $c) { return $c } }
+
+    $keys = @(
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
-        $hit = Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Qoder*' } | Select-Object -First 1
-        if ($hit -and $hit.DisplayIcon) {
-            return (($hit.DisplayIcon -split ',')[0]).Trim().Trim('"')
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
+    foreach ($k in $keys) {
+        $hits = @(Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Qoder*' })
+        foreach ($hit in $hits) {
+            $roots = @()
+            if ($hit.InstallLocation) { $roots += ([string]$hit.InstallLocation).Trim().Trim('"') }
+            if ($hit.DisplayIcon) {
+                $icon = (([string]$hit.DisplayIcon) -split ',')[0].Trim().Trim('"')
+                if ($icon) { $roots += [System.IO.Path]::GetDirectoryName($icon) }
+            }
+            if ($hit.UninstallString) {
+                $m = [regex]::Match(([string]$hit.UninstallString), '^\s*"([^"]+\.exe)"|^\s*([^\s]+\.exe)')
+                if ($m.Success) {
+                    $un = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
+                    $roots += [System.IO.Path]::GetDirectoryName($un)
+                }
+            }
+            foreach ($root in ($roots | Where-Object { $_ } | Select-Object -Unique)) {
+                $found = Get-QoderExeFromRoot $root
+                if ($found) { return $found }
+            }
         }
     }
     return $null

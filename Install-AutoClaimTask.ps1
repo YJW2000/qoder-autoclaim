@@ -1,4 +1,5 @@
 ﻿# 注册 Windows 计划任务: 每天 10:05 自动领取 Qoder 积分 (10:00 UTC+8 刷新)
+# 含午间/晚间/深夜重试、登录与解锁补跑
 # 用法: powershell -NoProfile -ExecutionPolicy Bypass -File Install-AutoClaimTask.ps1
 #       (如遇拒绝访问, 请用管理员 PowerShell 再跑一次)
 # 卸载: Unregister-ScheduledTask -TaskName Qoder-AutoClaim -Confirm:$false
@@ -25,6 +26,21 @@ $triggerDaily.Repetition = (New-ScheduledTaskTrigger -Once -At '10:05' -Repetiti
 $triggerLogon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $triggerLogon.Delay = 'PT10M'
 
+# 晚间补跑: 20:05 起每小时重试至 22:05, 覆盖白天关机/休眠、晚上才回来的情况
+$triggerEvening = New-ScheduledTaskTrigger -Daily -At '20:05'
+$triggerEvening.Repetition = (New-ScheduledTaskTrigger -Once -At '20:05' -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration (New-TimeSpan -Hours 2)).Repetition
+
+# 深夜补跑: 23:05 再试一次(领取窗口持续到次日 10:00)
+$triggerLate = New-ScheduledTaskTrigger -Daily -At '23:05'
+
+# 解锁补跑: 从睡眠/锁屏恢复后 1 分钟尝试一次
+$sessionClass = Get-CimClass -Namespace 'Root/Microsoft/Windows/TaskScheduler' -ClassName 'MSFT_TaskSessionStateChangeTrigger'
+$triggerUnlock = New-CimInstance -CimClass $sessionClass -ClientOnly
+$triggerUnlock.Enabled = $true
+$triggerUnlock.StateChange = 8   # TaskSessionUnlock
+$triggerUnlock.UserId = $env:USERNAME
+$triggerUnlock.Delay = 'PT1M'
+
 # 执行上限 1 小时; 主脚本的 -MaxWaitMinutes 默认 50, 两者需保持 50 < 60
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -37,8 +53,8 @@ $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interac
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggerDaily, $triggerLogon -Settings $settings -Principal $principal | Out-Null
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggerDaily, $triggerLogon, $triggerEvening, $triggerLate, $triggerUnlock -Settings $settings -Principal $principal | Out-Null
 
 Get-ScheduledTask -TaskName $TaskName | Format-List TaskName, State
 Get-ScheduledTaskInfo -TaskName $TaskName | Format-List NextRunTime, LastRunTime, LastTaskResult
-Write-Host "已注册计划任务 $TaskName (每天 10:05 起每小时重试至 12:05 + 登录后 10 分钟兜底)"
+Write-Host "已注册计划任务 $TaskName (10:05 起每小时重试至 12:05; 20:05 起重试至 22:05; 23:05 补跑; 登录 +10 分钟、解锁 +1 分钟补跑)"
